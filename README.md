@@ -66,7 +66,7 @@ cd dsh-image-inline
 node --test "tests/*.spec.mjs"   # 33 个用例：host 24 + client 7 + 并发/路由回归
 ```
 
-client 渲染用例从 DSH checkout 的 `node_modules` 解析 react/react-dom（默认 `/deepseekHarness/deepseek-harness/node_modules`；在其他机器上用 `DSH_HARNESS_NODE_MODULES` 环境变量指向任何装有 react@18 + react-dom@18 的 checkout）。找不到 react 时该套件自动跳过并提示，host 用例不受影响。
+client 渲染用例按以下顺序解析 react/react-dom：`DSH_HARNESS_NODE_MODULES` 环境变量指向的目录（需装有 react@18 + react-dom@18），或本仓库 `npm install` 后的本地 `node_modules`。找不到时该套件自动跳过并提示，host 用例不受影响。
 
 ## 已知限制
 

@@ -16,12 +16,14 @@ import assert from 'node:assert/strict'
 
 // The rendering suite below needs react + react-dom. This repo is
 // zero-install by design (no npm registry required for the host suite), so
-// they are resolved from a DSH harness checkout's node_modules instead of
-// devDependencies. Point DSH_HARNESS_NODE_MODULES at any checkout that has
-// react@18 + react-dom@18 installed to run the rendering suite elsewhere;
-// when no usable react is found the suite reports itself as skipped.
+// they are resolved from the environment instead of devDependencies:
+//   - DSH_HARNESS_NODE_MODULES: any directory whose node_modules contains
+//     react@18 + react-dom@18 (e.g. a DSH harness checkout), or
+//   - this repo's own node_modules (after `npm install` of the
+//     devDependencies).
+// When no usable react is found the suite reports itself as skipped.
 const HARNESS_NODE_MODULES =
-  process.env.DSH_HARNESS_NODE_MODULES || '/deepseekHarness/deepseek-harness/node_modules'
+  process.env.DSH_HARNESS_NODE_MODULES ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'node_modules')
 const require = createRequire(import.meta.url)
 
 /** Locate react-dom/server.node.js, tolerating different pnpm store layouts. */
