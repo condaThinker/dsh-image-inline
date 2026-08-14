@@ -1,0 +1,22 @@
+# dsh-image-inline bundle patch.
+# Installed via `dsh plugin --profile web add <path>`; the CLI reconciles
+# dsh.profile.bundles and mounts this row. Host half = dsh/index.js (the
+# package root export), client half = dsh/client.js (declared by dsh.client).
+- insert:
+    - id: image-inline
+      name: 'dsh-image-inline'
+      config:
+        # Maximum encoded image bytes a single show_image call accepts
+        # (checked against the file size before any read). Default 25 MiB.
+        maxImageBytes: 26214400
+        # Maximum pixel count (width * height) a show_image call accepts.
+        # Images larger than this are refused with a clear error. Default
+        # 40 MP (e.g. 8000x5000). Set to 0 to disable the pixel cap.
+        maxImagePixels: 40000000
+        # Image media types accepted, by file extension. Default: all four
+        # formats the DSH attachment service understands.
+        mediaTypes:
+          - 'image/png'
+          - 'image/jpeg'
+          - 'image/webp'
+          - 'image/gif'

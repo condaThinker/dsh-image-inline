@@ -1,0 +1,34 @@
+{
+  "name": "dsh-image-inline",
+  "version": "0.1.0",
+  "description": "Let the model render an image into the DSH web chat flow (QQ/WeChat style) via a show_image tool: the message content keeps only the path text, the image never enters model context, and the browser shows the picture inline, scrollable with history.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dsh/index.js",
+  "exports": {
+    ".": "./dsh/index.js",
+    "./client": "./dsh/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dsh",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test \"tests/*.spec.mjs\""
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
