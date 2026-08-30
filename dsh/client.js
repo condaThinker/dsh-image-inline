@@ -28,9 +28,17 @@ window.__ModuleLoader__.load({
     var exports = module.exports
 
     var React = require('react')
-    var attachment = require('@deepseek-ai/dsh-client-ui-attachment')
 
-    var MessageImage = attachment.MessageImage
+    /**
+     * NOTE: we deliberately do NOT import MessageImage from
+     * 'dsh-client-ui-attachment': since the 0.1.1-rc web split that module's
+     * browser bundle only exports the cordis plugin face (apply/inject) —
+     * MessageImage et al. are internal and NOT on module.exports anymore, so
+     * `attachment.MessageImage` is `undefined` and React.createElement(undefined)
+     * throws #130 ("Element type is invalid"), which the slot error boundary
+     * turns into an empty data-slot-error placeholder. Render plain <img> here
+     * instead (self-contained, same card chrome).
+     */
 
     /** Namespace this plugin owns in the DSH locale registry. */
     var NS = 'image-inline'
@@ -40,6 +48,7 @@ window.__ModuleLoader__.load({
       'title.running': '显示图片 {path}',
       'title.done': '图片已显示',
       'summary.done': '{path} · {width}x{height}px · {bytes} bytes',
+      'summary.donePlain': '{path}',
       'summary.error': '图片显示失败：{error}',
       'meta.missing': '缺少图片信息（attachmentId 不可用）',
       'label.image': '图片',
@@ -60,6 +69,7 @@ window.__ModuleLoader__.load({
       'title.running': 'Show image {path}',
       'title.done': 'Image shown',
       'summary.done': '{path} · {width}x{height}px · {bytes} bytes',
+      'summary.donePlain': '{path}',
       'summary.error': 'Failed to show image: {error}',
       'meta.missing': 'Image metadata missing (attachmentId unavailable)',
       'label.image': 'Image',
@@ -88,19 +98,66 @@ window.__ModuleLoader__.load({
       return '/plugin/show-image/' + encodeURIComponent(String(attachmentId))
     }
 
-    /** Build the MessageImage labels from the locale seat. */
-    function imageLabels(t) {
-      return {
-        image: t('label.image'),
-        open: t('label.open'),
-        openNamed: function (name) { return t('label.openNamed', { name: name }) },
-        loading: t('label.loading'),
-        loadFailed: t('label.loadFailed'),
-        lightbox: {
-          dialog: t('lightbox.dialog'),
-          close: t('lightbox.close'),
-        },
+    /** The plugin's path-addressed image URL for one display path. */
+    function pathImageUrl(path) {
+      return '/plugin/show-image-by-path?path=' + encodeURIComponent(path)
+    }
+
+    /**
+     * Extract the first `<path>…</path>` value from settled text blocks, or ''
+     * when none is present. Results without attachment meta (nested
+     * code-dispatched calls, pre-meta replays) still carry the path in the
+     * text the model produced, which is enough to render through the plugin's
+     * path-addressed route.
+     */
+    function pathFromBlocks(blocks) {
+      if (!Array.isArray(blocks)) return ''
+      for (var i = 0; i < blocks.length; i++) {
+        var block = blocks[i]
+        if (!block || block.type !== 'text' || typeof block.text !== 'string') continue
+        var match = /<path>([^<]+)<\/path>/.exec(block.text)
+        if (match && typeof match[1] === 'string' && match[1].trim() !== '') return match[1].trim()
       }
+      return ''
+    }
+
+    /** Join the text blocks of a settled result, best-effort. */
+    function textOfBlocks(blocks) {
+      var out = ''
+      if (!Array.isArray(blocks)) return out
+      for (var i = 0; i < blocks.length; i++) {
+        var block = blocks[i]
+        if (block && block.type === 'text' && typeof block.text === 'string') out += block.text
+      }
+      return out
+    }
+
+    /** The inline image card for one show_image call. */
+
+    /** Shared inline <img> card body (content-addressed or path-addressed URL). */
+    function imageLink(url, alt, onError) {
+      return React.createElement(
+        'a',
+        {
+          href: url,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+          title: alt,
+          'aria-label': alt,
+          style: { display: 'block', width: 'fit-content' },
+        },
+        React.createElement('img', {
+          src: url,
+          alt: alt,
+          onError: onError,
+          style: {
+            maxWidth: '240px',
+            maxHeight: '240px',
+            borderRadius: '8px',
+            display: 'block',
+          },
+        }),
+      )
     }
 
     /** The inline image card for one show_image call. */
@@ -111,6 +168,11 @@ window.__ModuleLoader__.load({
       // translator so a missing seat degrades to raw keys instead of a crash.
       var t = typeof props.t === 'function' ? props.t : function (key) { return key }
       if (!block || typeof block !== 'object') return null
+      // Path-fallback load state: when the path-addressed image fails to
+      // load we degrade to the plain text result instead of a broken img.
+      var pathFailedState = React.useState(false)
+      var pathFailed = pathFailedState[0]
+      var setPathFailed = pathFailedState[1]
       if ('kind' in block) {
         // Settled result.
         if (block.isError === true) {
@@ -156,27 +218,45 @@ window.__ModuleLoader__.load({
               bytes: meta.bytes,
             }),
           )
-          var img = React.createElement(MessageImage, {
-            attachment: ref,
-            variant: 'single',
-            labels: imageLabels(t),
-            load: function () {
-              return Promise.resolve(imageUrl(ref.attachmentId))
-            },
-          })
+          var imgUrl = imageUrl(ref.attachmentId)
           return React.createElement(
             'div',
             { 'data-image-inline-card': 'done' },
             row,
-            img,
+            imageLink(imgUrl, t('label.image'), function () { setPathFailed(true) }),
+            React.createElement(
+              'a',
+              {
+                href: imgUrl,
+                target: '_blank',
+                rel: 'noopener noreferrer',
+                style: { display: 'inline-block', margin: '2px 0 0', fontSize: '12px' },
+              },
+              t('label.open'),
+            ),
           )
         }
-        // Settled but no usable meta (e.g. a replay written by an older
-        // schema): show the plain text result.
-        var fallback = ''
-        var blocks = block.content || []
-        for (var j = 0; j < blocks.length; j++) {
-          if (blocks[j] && blocks[j].type === 'text') fallback += blocks[j].text
+        // Settled but no usable meta: this happens when the call ran as a
+        // nested dispatch inside run_code (the host registry only projects
+        // presentationMeta for top-level executions) or when the log predates
+        // the meta schema. The text still carries the <path>, so render the
+        // image through the plugin's path-addressed route instead of giving
+        // up; if that fails (file gone / wrong type), fall back to the plain
+        // text result.
+        var fallback = textOfBlocks(block.content)
+        var fallbackPath = pathFromBlocks(block.content)
+        if (fallbackPath !== '' && !pathFailed) {
+          var fallbackUrl = pathImageUrl(fallbackPath)
+          return React.createElement(
+            'div',
+            { 'data-image-inline-card': 'done-path' },
+            React.createElement(
+              'span',
+              { 'data-image-inline-summary': true, title: fallbackPath },
+              t('summary.donePlain', { path: fallbackPath }),
+            ),
+            imageLink(fallbackUrl, t('label.image'), function () { setPathFailed(true) }),
+          )
         }
         return React.createElement(
           'div',

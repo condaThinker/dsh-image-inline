@@ -186,11 +186,11 @@ describe('show_image tool (integration through the raw definition)', () => {
   })
 
   // Regression guard for the "cannot get property webServer without inject"
-  // incident: the route must be registered on the INJECTED scope (the scope
+  // incident: the routes must be registered on the INJECTED scope (the scope
   // carries webServer), never on the outer ctx — Cordis forbids reading an
   // injected service as a property of an uninjected context, and the outer
   // ctx here intentionally has NO webServer property.
-  it('registers the image route on the injected webServer scope', async () => {
+  it('registers both image routes on the injected webServer scope', async () => {
     const { apply } = await import('../dsh/index.js')
     const injectCalls = []
     const routeRegistrations = []
@@ -201,25 +201,27 @@ describe('show_image tool (integration through the raw definition)', () => {
     apply(ctx, defaultConfig())
     // The webServer inject callback must fire with a scope that owns
     // webServer; the effect wrapper receives the disposer.
-    let capturedDisposer
+    const capturedDisposers = []
     const webScope = {
       ...ctx,
       webServer: {
         register: (route) => {
           routeRegistrations.push(route)
-          return () => { capturedDisposer = 'disposed' }
+          return () => 'disposed'
         },
       },
-      effect: (fn) => { capturedDisposer = fn() },
+      effect: (fn) => { capturedDisposers.push(fn()) },
     }
     injectCalls[1][1](webScope)
-    assert.equal(routeRegistrations.length, 1)
+    assert.equal(routeRegistrations.length, 2)
     assert.equal(routeRegistrations[0].kind, 'prefix')
     assert.equal(routeRegistrations[0].path, '/plugin/show-image')
-    // effect holds the register disposer; invoking it must dispose the route.
-    assert.equal(typeof capturedDisposer, 'function')
-    capturedDisposer()
-    assert.equal(capturedDisposer, 'disposed')
+    assert.equal(routeRegistrations[1].kind, 'prefix')
+    assert.equal(routeRegistrations[1].path, '/plugin/show-image-by-path')
+    // effect holds the register disposers; invoking them must dispose the routes.
+    assert.equal(capturedDisposers.length, 2)
+    assert.ok(capturedDisposers.every((disposer) => typeof disposer === 'function'))
+    assert.ok(capturedDisposers.every((disposer) => disposer() === 'disposed'))
   })
 
   it('returns text-only content and a flat canonical value', async () => {
@@ -253,6 +255,19 @@ describe('show_image tool (integration through the raw definition)', () => {
   it('refuses unknown extensions', async () => {
     const tool = await mountTool()
     await assert.rejects(() => tool.execute({ path: '/ws/x.txt' }, fakeExec()), /only accepts PNG\/JPEG\/WebP\/GIF/)
+  })
+
+  // Regression guard for the post-0.1.1 dsh workspace gate: the fs service
+  // returns undefined (not an error) for paths outside the session workspace,
+  // which used to surface as a bare "reading 'size' of undefined" TypeError.
+  it('reports a clear not-found error when the fs service cannot see the path', async () => {
+    const fsImpl = {
+      resolve: async (path) => ({ targetKey: path, displayPath: path }),
+      stat: async () => undefined,
+      readBytes: async () => { throw new Error('must not read') },
+    }
+    const tool = await mountTool({ fsImpl })
+    await assert.rejects(() => tool.execute({ path: '/ws/x.png' }, fakeExec()), /cannot show "\/ws\/x\.png": not found/)
   })
 
   it('refuses oversized files before reading', async () => {
@@ -301,7 +316,7 @@ describe('show_image HTTP route handler', () => {
     const webScope = {
       ...ctx,
       webServer: {
-        register: (route) => { handler = route.handler; return () => {} },
+        register: (route) => { if (route.path === '/plugin/show-image') handler = route.handler; return () => {} },
       },
       effect: (fn) => fn(),
       get: (name) => name === 'attachments' ? {
@@ -368,7 +383,7 @@ describe('show_image HTTP route handler', () => {
     let handler
     const webScope = {
       ...ctx,
-      webServer: { register: (route) => { handler = route.handler; return () => {} } },
+      webServer: { register: (route) => { if (route.path === '/plugin/show-image') handler = route.handler; return () => {} } },
       effect: (fn) => fn(),
       get: () => undefined, // no attachments
     }
@@ -386,6 +401,93 @@ describe('show_image HTTP route handler', () => {
     const result = await invoke(handler)
     assert.equal(result.status, 404)
     rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+describe('show_image path route handler', () => {
+  const PNG_BYTES = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10])
+
+  // Mount apply() and capture the PATH route handler (second registration).
+  async function mountPathRoute({ fsImpl, config } = {}) {
+    const { apply } = await import('../dsh/index.js')
+    const injectCalls = []
+    const ctx = { get: () => undefined, inject: (names, fn) => { injectCalls.push([names, fn]) } }
+    apply(ctx, defaultConfig(config))
+    const handlers = []
+    const webScope = {
+      ...ctx,
+      webServer: {
+        register: (route) => { handlers.push(route.handler); return () => {} },
+      },
+      effect: (fn) => fn(),
+      get: (name) => name === 'fs' ? (fsImpl ?? {
+        resolve: async (path) => ({ path, displayPath: path }),
+        stat: async () => ({ type: 'file', size: PNG_BYTES.length, version: 1 }),
+        readBytes: async () => PNG_BYTES,
+      }) : undefined,
+    }
+    injectCalls[1][1](webScope)
+    return handlers[1]
+  }
+
+  /** Invoke the handler with a fake req/res; resolves {status, headers, body}. */
+  function invoke(handler, { method = 'GET', url = '/plugin/show-image-by-path?path=%2Fws%2Fa.png' } = {}) {
+    return new Promise((resolve) => {
+      const chunks = []
+      const res = {
+        writeHead: (status, headers) => { res.status = status; res.headers = headers },
+        end: (body) => { if (body) chunks.push(Buffer.from(body)); resolve({ status: res.status, headers: res.headers, body: Buffer.concat(chunks) }) },
+      }
+      handler({ method, url }, res)
+    })
+  }
+
+  it('serves an absolute path with content-type and a short private cache', async () => {
+    const handler = await mountPathRoute()
+    const result = await invoke(handler)
+    assert.equal(result.status, 200)
+    assert.equal(result.headers['content-type'], 'image/png')
+    assert.equal(result.headers['cache-control'], 'private, max-age=60')
+    assert.equal(result.body.length, PNG_BYTES.length)
+  })
+
+  it('rejects relative paths and missing query params', async () => {
+    const handler = await mountPathRoute()
+    assert.equal((await invoke(handler, { url: '/plugin/show-image-by-path?path=relative.png' })).status, 400)
+    assert.equal((await invoke(handler, { url: '/plugin/show-image-by-path' })).status, 400)
+  })
+
+  it('returns 404 for unknown extensions, missing files, and non-GET methods', async () => {
+    const handler = await mountPathRoute()
+    assert.equal((await invoke(handler, { url: '/plugin/show-image-by-path?path=%2Fws%2Fa.txt' })).status, 404)
+    const missing = await mountPathRoute({ fsImpl: {
+      resolve: async (path) => ({ path, displayPath: path }),
+      stat: async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) },
+      readBytes: async () => { throw new Error('must not read') },
+    } })
+    assert.equal((await invoke(missing)).status, 404)
+    assert.equal((await invoke(handler, { method: 'POST' })).status, 405)
+  })
+
+  it('returns 413 for files over the configured byte cap', async () => {
+    const handler = await mountPathRoute({ config: { maxImageBytes: 8 }, fsImpl: {
+      resolve: async (path) => ({ path, displayPath: path }),
+      stat: async () => ({ type: 'file', size: 9999, version: 1 }),
+      readBytes: async () => { throw new Error('must not read') },
+    } })
+    const result = await invoke(handler)
+    assert.equal(result.status, 413)
+  })
+})
+
+describe('pathFromRouteQuery', () => {
+  it('parses the path query parameter, decoded', () => {
+    assert.equal(internal.pathFromRouteQuery('/plugin/show-image-by-path?path=%2Fws%2Fa.png'), '/ws/a.png')
+  })
+  it('returns null for absent or empty values and malformed URLs', () => {
+    assert.equal(internal.pathFromRouteQuery('/plugin/show-image-by-path'), null)
+    assert.equal(internal.pathFromRouteQuery('/plugin/show-image-by-path?path='), null)
+    assert.equal(internal.pathFromRouteQuery('not a url'), null)
   })
 })
 

@@ -56,11 +56,8 @@ const renderKit = (() => {
 })()
 
 /** Minimal fake require serving the platform modules the bundle requests. */
-function makeRequire({ react, attachment }) {
-  const table = {
-    react,
-    '@deepseek-ai/dsh-client-ui-attachment': attachment,
-  }
+function makeRequire({ react }) {
+  const table = { react }
   return (name) => {
     if (!(name in table)) throw new Error(`client test: unexpected require("${name}")`)
     return table[name]
@@ -68,7 +65,7 @@ function makeRequire({ react, attachment }) {
 }
 
 /** Load dsh/client.js through the __ModuleLoader__ protocol and capture the exports. */
-function loadClientBundle({ react, attachment }) {
+function loadClientBundle({ react }) {
   const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'dsh', 'client.js'), 'utf8')
   let captured
   globalThis.window = {
@@ -84,13 +81,13 @@ function loadClientBundle({ react, attachment }) {
   const run = new Function('window', `${source}\n//# sourceURL=dsh-image-inline-client.js`)
   run(globalThis.window)
   // Mirror the real loader contract: factory(require) → module exports.
-  const exports = captured.factory(makeRequire({ react, attachment }))
+  const exports = captured.factory(makeRequire({ react }))
   return { id: captured.id, exports }
 }
 
 describe('dsh/client.js bundle', () => {
   it('loads through the __ModuleLoader__ protocol with the plugin id', () => {
-    const { id } = loadClientBundle({ react: {}, attachment: {} })
+    const { id } = loadClientBundle({ react: {} })
     assert.equal(id, 'dsh-image-inline')
   })
 
@@ -101,12 +98,12 @@ describe('dsh/client.js bundle', () => {
   // browser. The harness now evaluates the bundle with ONLY `window` in
   // scope, so this test fails loudly if the signature regresses.
   it('materializes with the loader-injected require (factory(require) contract)', () => {
-    const { exports } = loadClientBundle({ react: {}, attachment: {} })
+    const { exports } = loadClientBundle({ react: {} })
     assert.equal(typeof exports.apply, 'function')
   })
 
   it('exports the cordis plugin shape', () => {
-    const { exports } = loadClientBundle({ react: {}, attachment: {} })
+    const { exports } = loadClientBundle({ react: {} })
     assert.equal(exports.name, 'image-inline')
     assert.deepEqual(exports.inject, ['slots'])
     assert.equal(typeof exports.apply, 'function')
@@ -128,7 +125,7 @@ describe('dsh/client.js bundle', () => {
       },
       effect: (fn, label) => { /* locale registration is optional; disposer unused */ },
     }
-    const { exports } = loadClientBundle({ react: {}, attachment: {} })
+    const { exports } = loadClientBundle({ react: {} })
     exports.apply(ctx)
     assert.equal(registrations.length, 1)
     assert.equal(registrations[0].def.name, 'tool.call.toolview')
@@ -149,16 +146,7 @@ describe('ShowImageCard rendering', () => {
   let ShowImageCard
 
   before(() => {
-    // The real ui-attachment cannot be imported in node; stub MessageImage as
-    // a component that renders its attachment + load result.
-    const attachment = {
-      MessageImage: (props) =>
-        React.createElement('img', {
-          'data-testid': 'message-image',
-          alt: props.attachment.attachmentId,
-        }),
-    }
-    const { exports } = loadClientBundle({ react: React, attachment })
+    const { exports } = loadClientBundle({ react: React })
     // Capture the component registered by apply() through the slots contract:
     // inject defers to register, which records the (definition, Component).
     let capturedComponent
@@ -208,8 +196,8 @@ describe('ShowImageCard rendering', () => {
       t: (key, params) => key + (params ? JSON.stringify(params) : ''),
     }))
     assert.match(html, /data-image-inline-card="done"/)
-    assert.match(html, /data-testid="message-image"/)
-    assert.match(html, /sha256:dddd/)
+    assert.match(html, /plugin\/show-image\/sha256/)
+    assert.match(html, /<img/)
   })
 
   it('renders an error result without crashing', () => {
@@ -230,13 +218,32 @@ describe('ShowImageCard rendering', () => {
     assert.match(html, /summary\.error/)
   })
 
-  it('renders a settled result without meta as a text fallback', () => {
+  it('renders a settled result without meta but with a path via the path route', () => {
     const block = {
       kind: 'tool-result',
       seq: 10, time: 2, callId: 'c1',
       call: { name: 'show_image', argsRaw: '{"path":"/ws/a.png"}' },
       callTime: 1,
-      content: [{ type: 'text', text: '<path>/ws/a.png</path>' }],
+      content: [{ type: 'text', text: '<path>/ws/a.png</path>\n<type>image</type>\n<content>\nimage/png image, 2x2 px, 4 bytes\n</content>' }],
+      isError: false,
+      callView: null, resultView: null, subCalls: [],
+    }
+    const html = renderToStaticMarkup(React.createElement(ShowImageCard, {
+      callId: 'c1', toolName: 'show_image', block,
+      t: (key) => key,
+    }))
+    assert.match(html, /data-image-inline-card="done-path"/)
+    assert.match(html, /\/plugin\/show-image-by-path\?path=%2Fws%2Fa\.png/)
+    assert.match(html, /<img/)
+  })
+
+  it('renders a settled result without meta and without a path as a text fallback', () => {
+    const block = {
+      kind: 'tool-result',
+      seq: 10, time: 2, callId: 'c1',
+      call: { name: 'show_image', argsRaw: '{"path":"/ws/a.png"}' },
+      callTime: 1,
+      content: [{ type: 'text', text: 'no path here' }],
       isError: false,
       callView: null, resultView: null, subCalls: [],
     }
@@ -246,5 +253,6 @@ describe('ShowImageCard rendering', () => {
     }))
     assert.match(html, /data-image-inline-card="meta-missing"/)
     assert.match(html, /meta\.missing/)
+    assert.match(html, /no path here/)
   })
 })

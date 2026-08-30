@@ -57,6 +57,17 @@ const DEFAULTS = {
 /** HTTP route prefix serving one image by its content-addressed attachment id. */
 const ROUTE_PREFIX = '/plugin/show-image'
 
+/**
+ * HTTP route prefix serving one image by its display path (query `?path=`).
+ * Fallback for results whose `tool/result`/`tool/code-dispatch` event carries
+ * no attachment meta — nested `show_image` calls dispatched from inside
+ * `run_code` (the host tool registry only projects `presentationMeta` for
+ * top-level executions) and replays written before the meta schema. The model
+ * already committed the path to the session text, so the client can ask this
+ * route for the bytes and still render the picture.
+ */
+const PATH_ROUTE_PREFIX = '/plugin/show-image-by-path'
+
 /** The `sha256:<64-hex>` attachment id shape, anchored for route extraction. */
 const ATTACHMENT_ID_PATTERN = /^sha256:[0-9a-f]{64}$/
 
@@ -141,7 +152,24 @@ async function resolveDisplayPath(ctx, exec, requestedPath) {
       ...typeof cwd === 'string' ? { cwd } : {},
       signal: exec.signal,
     })
+    // The fs service stat()s the resolved target. Current DSH fs services
+    // gate access to the session workspace: a path outside it (or otherwise
+    // not visible through the policy) makes stat() return undefined instead
+    // of throwing — so surface a clear error rather than a bare TypeError
+    // downstream ("reading 'size' of undefined").
     const info = await fs.stat(target, exec.signal)
+    if (info === undefined) {
+      const error = new Error(
+        `cannot show "${target.displayPath}": not found${isAbsolute(requestedPath) && !requestedPath.startsWith(cwd ?? '/nonexistent') ? ' (path is outside the current session workspace)' : ''}`,
+      )
+      error.code = 'FS_NOT_FOUND'
+      throw error
+    }
+    if (typeof info.size !== 'number') {
+      const error = new Error(`cannot show "${target.displayPath}": not a regular file`)
+      error.code = 'FS_NOT_REGULAR_FILE'
+      throw error
+    }
     return { target, info }
   }
   // No fs service (unlikely): accept only absolute paths, resolve plainly.
@@ -174,7 +202,7 @@ async function readBytes(ctx, target, signal, byteCap) {
     return fs.readBytes(target, signal, byteCap)
   }
   const { readFile } = await import('node:fs/promises')
-  const data = await readFile(target.path)
+  const data = await readFile(target.targetKey ?? target.path)
   if (data.byteLength > byteCap) {
     const error = new Error(`cannot show "${target.displayPath}": file is larger than the configured ${byteCap} byte limit`)
     error.code = 'TOO_LARGE'
@@ -344,6 +372,18 @@ function attachmentIdFromPath(pathname) {
   return ATTACHMENT_ID_PATTERN.test(id) ? id : null
 }
 
+/** Parse the `path` query parameter from a request URL, or null when absent. */
+function pathFromRouteQuery(url) {
+  let parsed
+  try {
+    parsed = new URL(url, 'http://localhost')
+  } catch {
+    return null
+  }
+  const value = parsed.searchParams.get('path')
+  return typeof value === 'string' && value.trim() !== '' ? value : null
+}
+
 /** Content-type header for one media type. */
 function contentTypeFor(mediaType) {
   const table = {
@@ -429,6 +469,99 @@ function registerImageRoute(scope, registryFile) {
   return disposer
 }
 
+/**
+ * Serve one image by its display path (query `?path=`), validating exactly
+ * like `execute` does: media type by file extension, regular file, configured
+ * byte cap. This is the rendering fallback for results without attachment
+ * meta — nested `show_image` calls dispatched from `run_code` and replays of
+ * sessions written before the meta schema. The path is taken from the
+ * session text the model produced, under the same loopback trust model as
+ * the content-addressed route.
+ *
+ * @param scope - the injected scope that carries `webServer`; `get` on it
+ *   reaches the fs service (and attachments, though unused here).
+ * @param config - resolved plugin config (mediaTypes / maxImageBytes).
+ */
+function registerPathImageRoute(scope, config) {
+  const disposer = scope.webServer.register({
+    kind: 'prefix',
+    path: PATH_ROUTE_PREFIX,
+    handler: async (req, res) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { allow: 'GET, HEAD' })
+        res.end()
+        return
+      }
+      const requestedPath = pathFromRouteQuery(req.url ?? '')
+      if (requestedPath === null || !isAbsolute(requestedPath)) {
+        res.writeHead(400)
+        res.end('bad request')
+        return
+      }
+      const mediaType = mediaTypeForPath(requestedPath, config)
+      if (mediaType === undefined) {
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
+      const fs = scope.get?.('fs')
+      let target
+      try {
+        if (fs && typeof fs.resolve === 'function' && typeof fs.stat === 'function') {
+          target = await fs.resolve(requestedPath, {})
+          const info = await fs.stat(target)
+          if (typeof info.size === 'number' && info.size > config.maxImageBytes) {
+            res.writeHead(413)
+            res.end('image too large')
+            return
+          }
+        } else {
+          const info = statSync(requestedPath)
+          if (!info.isFile()) {
+            res.writeHead(404)
+            res.end('not found')
+            return
+          }
+          if (info.size > config.maxImageBytes) {
+            res.writeHead(413)
+            res.end('image too large')
+            return
+          }
+          target = { path: requestedPath, displayPath: requestedPath }
+        }
+      } catch {
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
+      let data
+      try {
+        data = await readBytes(scope, target, undefined, config.maxImageBytes)
+      } catch {
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
+      const headers = {
+        'content-type': contentTypeFor(mediaType),
+        // Path-addressed, not content-addressed: the file may change, so no
+        // immutable long cache. A modest private cache keeps repeated history
+        // scrolls cheap without pinning stale bytes for long.
+        'cache-control': 'private, max-age=60',
+        'content-length': String(data.byteLength),
+      }
+      if (req.method === 'HEAD') {
+        res.writeHead(200, headers)
+        res.end()
+        return
+      }
+      res.writeHead(200, headers)
+      res.end(Buffer.from(data))
+    },
+  })
+  return disposer
+}
+
 /** Validate resolved config values; throws on invalid input. */
 function assertConfig(config) {
   if (!Number.isInteger(config.maxImageBytes) || config.maxImageBytes < 1) {
@@ -470,12 +603,13 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  // The HTTP route is web-only; register when the web server appears. The
-  // route must be registered on the injected scope (its `webServer` property
+  // The HTTP routes are web-only; register when the web server appears. The
+  // routes must be registered on the injected scope (its `webServer` property
   // is only readable there), not on the outer ctx.
   ctx.inject(['webServer'], (webCtx) => {
     try {
       webCtx.effect(() => registerImageRoute(webCtx, registryFile), 'dsh-image-inline: image route')
+      webCtx.effect(() => registerPathImageRoute(webCtx, resolved), 'dsh-image-inline: path image route')
     } catch (error) {
       console.error(`[dsh-image-inline] image route skipped: ${error}`)
     }
@@ -487,6 +621,7 @@ export const _internal = {
   MEDIA_TYPES,
   DEFAULTS,
   ROUTE_PREFIX,
+  PATH_ROUTE_PREFIX,
   ATTACHMENT_ID_PATTERN,
   registryPath,
   readRegistry,
@@ -495,6 +630,7 @@ export const _internal = {
   mediaTypeForPath,
   formatShowImageOutput,
   attachmentIdFromPath,
+  pathFromRouteQuery,
   contentTypeFor,
   assertConfig,
 }

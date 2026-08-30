@@ -19,6 +19,12 @@
                                         └─ GET /plugin/show-image/<attachmentId> → 图片字节
 ```
 
+### 嵌套调用（run_code 内 `tools.show_image`）与旧回放
+
+模型把 `show_image` 写进 `run_code` 的 JS 里（"Show key figures to user" 这类批量展示）时，调用变成**嵌套 code-dispatch**：宿主工具注册表只对顶层执行投影 `presentationMeta`，`tool/code-dispatch` 事件只携带文本结果、没有 attachmentId——客户端无法走内容寻址路由。
+
+处理方式：**client 在 meta 缺失时解析结果文本里的 `<path>`，改走路径寻址路由** `GET /plugin/show-image-by-path?path=<绝对路径>`（host 按扩展名/regular file/字节上限校验后回字节，路径来自模型已写入会话的文本，同 loopback 信任模型）。因此嵌套调用与旧 schema 回放都能渲染图片；文件不存在/格式不对时 `onError` 自动退回原文本结果。`tool/result` 事件带 meta 的顶层调用不受影响，仍走内容寻址路由。
+
 ### 为什么需要插件自己的 HTTP 端点？
 
 DSH 内置的 `conversation.resolveImage` → `session.attachment` RPC 只服务"会话日志的 image 块里被引用的附件"（`api-proxy` 的 `referencedImage` 授权）。本插件的结果**故意不包含 image 块**（否则图片会进入模型上下文），因此附件永远不会被日志引用，必须由插件自己提供读取通道。
